@@ -55,11 +55,15 @@ It trains on some sessions and tests on one it hasn't seen, so it needs at least
 
 Solder the two VBUS pads on either the top or the bottom of the Nano 33 BLE Sense Rev2 together.
 Connect APA102 LED wires to Nano 33 BLE Sense Rev2 accordingly:
+
    Connect CLK to D13, Data to D11, Ground to Ground, and Input voltage to 5V out.
 
 Download Arduino IDE
+
 Connect Nano 33 BLE Sense Rev2 to laptop and selected board from dropdown list on Arduino IDE.
+
 Go to Tools > Manage Libraries > Type in Adafruit Dotstar and install the library along with dependent libraries.
+
 Go to Files > Examples > Adafruit Dotstar > onboard. Compile and run the code by clicking the (->) icon in the task bar at top.
 
 
