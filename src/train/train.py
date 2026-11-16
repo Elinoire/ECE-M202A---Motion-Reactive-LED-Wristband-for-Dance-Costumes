@@ -1,33 +1,33 @@
-"""Train ONE model on all orientations pooled and measure how well it
-generalizes, comparing several feature / training recipes.
+"""Train ONE model on all orientations pooled and measure how well it generalizes,
+comparing several feature / training recipes.
 
-Evaluation (both printed for every recipe):
-  * Blocked 5-fold CV: each recording is cut into contiguous time blocks and
-    every block is tested once. Windows within GAP of a test block are dropped
-    from training so overlapping windows never leak.
-  * Leave-one-session-out (LOSO): train on all sessions but one, test on the
-    held-out one. Approximates an orientation / wearer the model never saw.
-    This is the number that matters for a wearable.
-Both are also reported with causal majority-vote SMOOTHING over the last
-SMOOTH window predictions (what the board would do on its output).
+Evaluation: leave-one-session-out (LOSO). Train on all sessions but one, test on the
+held-out one. This approximates an orientation / wearer the model never saw, so it is
+the number that matters for a wearable. Every recipe is reported twice:
+  * raw       - one forest prediction per window
+  * soft vote - what the board shows: EMA of tree-vote fractions with a switch margin,
+                a hold time and a fast switch (SOFT_* below; keep in sync with main.cpp)
 
 Recipes (CONFIGS below):
-  base+shape            56 base + 13 shape features (previous baseline)
-  +gravity              adds 13 gravity-frame features
+  base+shape            base + shape features
+  +gravity              adds gravity-frame features
   +gravity+aug          same, training data also gets rotated copies
-  +gravity+phase+aug    also adds 8 phase features (needs an FFT on the board;
-                        drop it if it doesn't beat +gravity+aug)
+  +gravity+phase+aug    also adds phase features (needs extra DFT work on the board)
 
-Diagnostics printed for the best recipe (by LOSO):
-  * which ORIGINAL label (leftright vs frontback) is being confused with
-    circle_x, overall and per session
-  * the 3 weakest sessions' confusion matrices
-  * the 10 worst individual recordings (possible bad / mislabeled takes)
-  * a smoothing sweep with the extra delay each setting adds
+Diagnostics printed for the best recipe (by raw LOSO):
+  * which ORIGINAL label (leftright vs frontback) is confused with circle_x
+  * the weakest sessions' confusion matrices and the worst individual recordings
+  * FLICKER: majority vote vs soft vote, as accuracy and flips/min. Each recording
+    holds ONE gesture, so every label change is flicker.
   * what accuracy would be if horizontal and circle_x were ONE class
+  * top feature importances
 
-Labels leftright + frontback are merged into "horizontal" (MERGE) for
-training, but the original names are kept for the diagnostics.
+Labels leftright + frontback are merged into "horizontal" (MERGE) for training, but the
+original names are kept for the diagnostics.
+
+Other scripts import from this file: tools/export_model.py (CONFIGS, group_columns,
+load_data, make_model, FEATURE_NAMES, SMOOTH, ...) and tools/wbcommon.py (window_features,
+EXCLUDE, MERGE, ...). Keep those names.
 
 Usage (repo root):  python3 src/train/train.py
 """
@@ -41,18 +41,26 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 
 # ---------------------------------------------------------------- settings
 SAMPLE_HZ = 89
-WIN = 100
+WIN = 80
 STRIDE = 25
 DOM_BINS = 12
 TRIM = 100
-K_FOLDS = 5
-GAP = -(-WIN // STRIDE)          # windows dropped next to a test block
-SMOOTH = 5                       # majority vote over the last N predictions
-SMOOTH_SWEEP = (1, 3, 5, 8, 12)  # k = 1 means no smoothing
+SMOOTH = 5                       # old majority-vote size: baseline in the flicker table, read by export_model.py
 N_WEAK_SESSIONS = 3
 N_WORST_FILES = 10
 TRAIN_GLOB = "data/*.csv"
 EPS = 1e-9
+
+# Soft vote settings (must match the constants in main.cpp).
+# HOLD is counted in predictions: one prediction = STRIDE / SAMPLE_HZ = 0.28 s.
+SOFT_ALPHA = 0.6
+SOFT_MARGIN = 0.3
+SOFT_MIN_SCORE = 0.35
+SOFT_HOLD = 2
+# Fast switch: if the new class is already clearly ahead, switch without waiting
+# for the hold or the full margin. None disables it (the sweep compares both).
+SOFT_FAST_SCORE = 0.55
+SOFT_FAST_MARGIN = 0.15
 
 # Augmentation. Yaw is kept SMALL on purpose: circle_x vs circle_y vs diagonal
 # may depend on direction in the horizontal plane, and a full 360 deg yaw
@@ -66,17 +74,14 @@ SEED = 0
 MERGE = {"leftright": "horizontal", "frontback": "horizontal"}
 
 # Session regrouping (used only for LOSO grouping and the per-session reports,
-# never as a feature). Right now horizontal data exists only in s1-s6, so the
-# horizontal class is never tested in s7-s12. This shifts every frontback file
-# forward by 6 session numbers (s1 -> s7, ... s6 -> s12), so leftright covers
-# s1-s6, frontback covers s7-s12, and every session has one file per class.
-# Set to {} to use the sessions as recorded.
+# never as a feature). Horizontal data exists only in s1-s6, so this shifts every
+# frontback file forward by 6 session numbers: leftright covers s1-s6, frontback
+# covers s7-s12, and every session has one file per class. {} = sessions as recorded.
 SESSION_SHIFT = {"frontback": 6}
 
 # Recordings to leave out entirely (file names, not paths). These four were
 # 82-99% misclassified in LOSO and look mislabeled or recorded differently.
-# This is a DIAGNOSTIC: report scores with and without them, and re-record
-# rather than quietly dropping data. Set to set() to use every file.
+# Re-record rather than quietly dropping data. Set to set() to use every file.
 EXCLUDE = {
     "circle_x_s11_1794710971.csv",
     "frontback_s6_1794701141.csv",
@@ -86,6 +91,7 @@ EXCLUDE = {
 
 # Feature column groups (sizes are asserted at load time).
 GROUP_SIZES = {"base": 56, "shape": 13, "grav": 13, "phase": 8}
+DROP_PREFIXES = ("domfreq_",)   # features left out of every recipe; () brings them back
 CONFIGS = [
     # name,                  feature groups,                       augment?
     ("base+shape",           ("base", "shape"),                    False),
@@ -99,6 +105,16 @@ def make_model():
     # Same size as the exported model, so these numbers match the board.
     return RandomForestClassifier(n_estimators=50, max_depth=12, min_samples_leaf=2,
                                   class_weight="balanced", random_state=0, n_jobs=-1)
+
+
+def vote_frac(clf, X):
+    """Fraction of trees voting for each class (what the firmware computes).
+
+    Each tree casts one hard vote, like treeVotes() in main.cpp. This differs
+    slightly from sklearn's predict_proba, which averages leaf probabilities.
+    """
+    votes = np.stack([e.predict(X) for e in clf.estimators_]).astype(int)  # (trees, n)
+    return np.stack([(votes == c).mean(0) for c in range(len(clf.classes_))], axis=1)
 
 
 # ---------------------------------------------------------------- features
@@ -231,14 +247,6 @@ def _names():
 FEATURE_NAMES = _names()
 
 
-# def group_columns(groups):
-#     start, cols = 0, {}
-#     for name, size in GROUP_SIZES.items():
-#         cols[name] = np.arange(start, start + size)
-#         start += size
-#     return np.concatenate([cols[g] for g in groups])
-DROP_PREFIXES = ("domfreq_",)   # set to () to bring them back
-
 def group_columns(groups):
     start, cols = 0, {}
     for name, size in GROUP_SIZES.items():
@@ -311,43 +319,28 @@ def _train_matrix(F, Fa, y, cols, use_aug):
     return X, Y
 
 
-def blocked_cv(data, cols, use_aug, k=K_FOLDS):
-    """Each file is cut into k contiguous blocks; every block is tested once."""
-    ys, ps, gs, segs = [], [], [], []
-    for fold in range(k):
-        Ftr, Fatr, ytr, Xte, yte, gte, ste = [], [], [], [], [], [], []
-        for fi, d in enumerate(data):
-            n = len(d["F"])
-            lo, hi = fold * n // k, (fold + 1) * n // k
-            idx = np.arange(n)
-            tr = (idx < lo - GAP) | (idx >= hi + GAP)
-            Ftr.append(d["F"][tr]); Fatr.append(d["Faug"][tr])
-            ytr += [d["label"]] * int(tr.sum())
-            Xte.append(d["F"][lo:hi][:, cols])
-            yte += [d["label"]] * (hi - lo)
-            gte += [d["session"]] * (hi - lo)
-            ste += [fold * len(data) + fi] * (hi - lo)
-        X, Y = _train_matrix(np.vstack(Ftr), np.concatenate(Fatr), ytr, cols, use_aug)
-        clf = make_model().fit(X, Y)
-        ps += list(clf.predict(np.vstack(Xte)))
-        ys += yte; gs += gte; segs += ste
-    return np.array(ys), np.array(ps), np.array(gs), np.array(segs)
-
-
 def loso(data, cols, use_aug):
     """Leave-one-session-out: how well does it handle an unseen orientation?
-    Output order follows the file order of `data` (segment id = file index)."""
+
+    Output order follows the file order of `data` (segment id = file index).
+    Returns (y, pred, groups, segments, frac) where frac[i, c] is the fraction
+    of trees voting for class c (classes in sorted order) on window i.
+    """
     F = np.vstack([d["F"] for d in data])
     Fa = np.concatenate([d["Faug"] for d in data])
     y = np.concatenate([[d["label"]] * len(d["F"]) for d in data])
     g = np.concatenate([[d["session"]] * len(d["F"]) for d in data])
     seg = np.concatenate([[i] * len(d["F"]) for i, d in enumerate(data)])
-    pred = np.empty_like(y)
+    classes = np.array(sorted(set(y)))
+    frac = np.zeros((len(y), len(classes)))
     for s in sorted(set(g)):
         te = g == s
         X, Y = _train_matrix(F[~te], Fa[~te], y[~te], cols, use_aug)
-        pred[te] = make_model().fit(X, Y).predict(F[te][:, cols])
-    return y, pred, g, seg
+        clf = make_model().fit(X, Y)
+        # assumes every class is in the training fold (true while each session has all classes)
+        frac[te] = vote_frac(clf, F[te][:, cols])
+    pred = classes[frac.argmax(1)]          # hard vote, ties -> lowest index, like the board
+    return y, pred, g, seg, frac
 
 
 def smooth(pred, segs, k=SMOOTH):
@@ -362,7 +355,46 @@ def smooth(pred, segs, k=SMOOTH):
     return out
 
 
-def report(name, y_true, y_pred, groups, labels):
+def soft_vote(frac, segs, alpha=SOFT_ALPHA, margin=SOFT_MARGIN,
+              min_score=SOFT_MIN_SCORE, hold=SOFT_HOLD,
+              fast_score=SOFT_FAST_SCORE, fast_margin=SOFT_FAST_MARGIN):
+    """Same logic as vote() in main.cpp: EMA of tree vote fractions.
+
+    Slow path: switch if the new class leads the current one by `margin`, has at
+    least `min_score`, and `hold` predictions passed since the last switch.
+    Fast path (if fast_score is not None): switch right away, ignoring the hold,
+    if the new class has at least `fast_score` and leads by `fast_margin`.
+    Returns class INDICES (into the sorted class list)."""
+    out = np.empty(len(frac), int)
+    for s in np.unique(segs):
+        idx = np.where(segs == s)[0]
+        score, cur, since = None, -1, 0
+        for i in idx:
+            since += 1
+            score = frac[i].copy() if score is None else alpha * score + (1 - alpha) * frac[i]
+            best = int(score.argmax())
+            if cur < 0:
+                cur, since = best, 0
+            elif best != cur:
+                fast = (fast_score is not None and score[best] >= fast_score
+                        and score[best] >= score[cur] + fast_margin)
+                slow = (since >= hold and score[best] >= min_score
+                        and score[best] >= score[cur] + margin)
+                if fast or slow:
+                    cur, since = best, 0
+            out[i] = cur
+    return out
+
+
+def flips_per_min(p, segs):
+    """Label changes per minute. Each recording is one gesture, so all are flicker."""
+    flips = sum(int((p[segs == s][1:] != p[segs == s][:-1]).sum()) for s in np.unique(segs))
+    minutes = len(p) * STRIDE / SAMPLE_HZ / 60
+    return flips / minutes
+
+
+# ------------------------------------------------------------------ reports
+def report(name, y_true, y_pred, groups, classes):
     print(f"\n--- {name} ---")
     for s in sorted(set(groups)):
         m = groups == s
@@ -370,11 +402,10 @@ def report(name, y_true, y_pred, groups, labels):
     print(f"  overall        acc {accuracy_score(y_true, y_pred):.3f}")
     print(classification_report(y_true, y_pred, digits=3, zero_division=0))
     print("Confusion matrix (rows = true, cols = predicted):")
-    print("labels:", [str(l) for l in labels])
-    print(confusion_matrix(y_true, y_pred, labels=labels))
+    print("labels:", [str(c) for c in classes])
+    print(confusion_matrix(y_true, y_pred, labels=classes))
 
 
-# ------------------------------------------------------------- diagnostics
 def diagnose_merged(raw, p, g):
     """Which original label (e.g. leftright vs frontback) is getting confused?"""
     raws = sorted(r for r in MERGE if (raw == r).any())
@@ -390,7 +421,7 @@ def diagnose_merged(raw, p, g):
               + ", ".join(f"{v} {c / m.sum():.0%}" for v, c in order))
         wrong = [(v, c) for v, c in order if v != MERGE[r]]
         tops[r] = wrong[0][0] if wrong else None
-    print(f"\n  per session: % predicted correctly, and % predicted as its top wrong class")
+    print("\n  per session: % predicted correctly, and % predicted as its top wrong class")
     head = f"  {'session':<8}"
     for r in raws:
         head += f"{r + ' ok':>16}{'-> ' + (tops[r] or '-'):>16}"
@@ -408,15 +439,15 @@ def diagnose_merged(raw, p, g):
         print(row)
 
 
-def weak_sessions(y, p, g, labels):
+def weak_sessions(y, p, g, classes):
     accs = {s: accuracy_score(y[g == s], p[g == s]) for s in sorted(set(g))}
     worst = sorted(accs, key=accs.get)[:N_WEAK_SESSIONS]
-    print(f"\n--- weakest sessions (LOSO, raw predictions) ---")
-    print("labels:", [str(l) for l in labels])
+    print("\n--- weakest sessions (LOSO, raw predictions) ---")
+    print("labels:", [str(c) for c in classes])
     for s in worst:
         m = g == s
         print(f"\n  {s}: acc {accs[s]:.3f}  (rows = true, cols = predicted)")
-        print(confusion_matrix(y[m], p[m], labels=labels))
+        print(confusion_matrix(y[m], p[m], labels=classes))
 
 
 def worst_files(data, y, p, seg):
@@ -437,23 +468,42 @@ def worst_files(data, y, p, seg):
         print(f"  {acc:>5.2f}  {session:<8}{raw:<12}{top:<24}{path}")
 
 
-def smoothing_sweep(y, p, seg):
-    print("\n--- smoothing sweep (LOSO) ---")
-    print(f"  {'k':>3}{'accuracy':>10}{'extra delay':>14}")
-    for k in SMOOTH_SWEEP:
-        a = accuracy_score(y, smooth(p, seg, k) if k > 1 else p)
-        delay = (-(-k // 2) - 1) * STRIDE / SAMPLE_HZ   # extra predictions needed to flip
-        print(f"  {k:>3}{a:>10.3f}{delay:>12.2f} s")
-    print(f"  (each prediction is {STRIDE / SAMPLE_HZ:.2f} s apart; the {WIN / SAMPLE_HZ:.1f} s "
-          f"window itself adds delay on top of this)")
+def soft_vote_sweep(y, p, frac, seg, classes):
+    """Flicker (flips/min) and accuracy: raw, majority vote, soft vote variants."""
+    print("\n--- flicker: majority vote vs soft vote (LOSO) ---")
+    print(f"  {'method':<34}{'accuracy':>9}{'flips/min':>11}")
+    print(f"  {'raw':<34}{accuracy_score(y, p):>9.3f}{flips_per_min(p, seg):>11.1f}")
+    pm = smooth(p, seg)
+    print(f"  {f'majority vote (k={SMOOTH}, old)':<34}"
+          f"{accuracy_score(y, pm):>9.3f}{flips_per_min(pm, seg):>11.1f}")
+    q = classes[soft_vote(frac, seg)]
+    print(f"  {'soft vote (firmware settings)':<34}"
+          f"{accuracy_score(y, q):>9.3f}{flips_per_min(q, seg):>11.1f}")
+    for alpha in (0.5, 0.6, 0.7):
+        for margin in (0.12, 0.2, 0.3):
+            q = classes[soft_vote(frac, seg, alpha=alpha, margin=margin, fast_score=None)]
+            print(f"  {f'soft a={alpha} margin={margin}':<34}"
+                  f"{accuracy_score(y, q):>9.3f}{flips_per_min(q, seg):>11.1f}")
+    print("  (higher alpha / margin = fewer flips but slower to react; "
+          f"hold = {SOFT_HOLD} predictions, min_score = {SOFT_MIN_SCORE})")
+
+    # Fast switch: should switch EARLIER at about the same accuracy and flips/min.
+    print("\n--- fast switch on top of soft vote (LOSO) ---")
+    print(f"  {'method':<34}{'accuracy':>9}{'flips/min':>11}")
+    for alpha in (0.6, 0.7):
+        for fs in (None, 0.65, 0.55, 0.5):
+            q = classes[soft_vote(frac, seg, alpha=alpha, margin=0.3, fast_score=fs)]
+            label = f"a={alpha} m=0.3 fast={fs}"
+            print(f"  {label:<34}{accuracy_score(y, q):>9.3f}{flips_per_min(q, seg):>11.1f}")
+    print(f"  (fast margin = {SOFT_FAST_MARGIN}; lower fast_score = earlier switches. Pick the lowest "
+          "value whose accuracy and flips/min stay close to the fast=None row.)")
 
 
-def merged_what_if(y, p, seg):
+def merged_what_if(y, p, ps):
     f = lambda a: np.where(np.isin(a, ["horizontal", "circle_x"]), "horizontal_or_circle_x", a)
     print("\n--- what if horizontal and circle_x were ONE class? (LOSO) ---")
-    print(f"  raw accuracy      {accuracy_score(f(y), f(p)):.3f}   (now {accuracy_score(y, p):.3f})")
-    ps = smooth(p, seg)
-    print(f"  smoothed accuracy {accuracy_score(f(y), f(ps)):.3f}   (now {accuracy_score(y, ps):.3f})")
+    print(f"  raw accuracy        {accuracy_score(f(y), f(p)):.3f}   (now {accuracy_score(y, p):.3f})")
+    print(f"  soft-vote accuracy  {accuracy_score(f(y), f(ps)):.3f}   (now {accuracy_score(y, ps):.3f})")
     print("  (evaluation-only: a model trained with them merged could do slightly better)")
 
 
@@ -463,45 +513,40 @@ def main():
 
     print("Computing features (including augmented copies)...")
     data = load_data()
-    labels = sorted({d["label"] for d in data})
+    classes = np.array(sorted({d["label"] for d in data}))
     n_win = sum(len(d["F"]) for d in data)
     print(f"{len(data)} files | {n_win} windows | "
-          f"{sum(GROUP_SIZES.values())} candidate features | classes: {labels}")
+          f"{sum(GROUP_SIZES.values())} candidate features | classes: {list(classes)}")
 
     results = {}
     for name, groups, use_aug in CONFIGS:
         cols = group_columns(groups)
         print(f"\nRunning '{name}' ({len(cols)} features, aug={use_aug}) ...")
-        results[name] = {"blocked": blocked_cv(data, cols, use_aug),
-                         "loso": loso(data, cols, use_aug)}
+        y, p, g, seg, frac = loso(data, cols, use_aug)
+        results[name] = (y, p, g, seg, frac, classes[soft_vote(frac, seg)])
 
     # ------------------------------------------------------------ summary
-    def acc(r, smoothed):
-        y, p, _, seg = r
-        return accuracy_score(y, smooth(p, seg) if smoothed else p)
-
-    print("\n" + "=" * 78)
-    print(f"{'recipe':<22}{'blocked':>9}{'blk+smooth':>12}{'LOSO':>9}{'LOSO+smooth':>13}")
+    print("\n" + "=" * 70)
+    print(f"{'recipe':<22}{'LOSO':>8}{'LOSO+soft':>11}{'flips/min raw':>15}{'-> soft':>9}")
     for name, _, _ in CONFIGS:
-        r = results[name]
-        print(f"{name:<22}{acc(r['blocked'], False):>9.3f}{acc(r['blocked'], True):>12.3f}"
-              f"{acc(r['loso'], False):>9.3f}{acc(r['loso'], True):>13.3f}")
-    print("=" * 78)
+        y, p, _, seg, _, ps = results[name]
+        print(f"{name:<22}{accuracy_score(y, p):>8.3f}{accuracy_score(y, ps):>11.3f}"
+              f"{flips_per_min(p, seg):>15.1f}{flips_per_min(ps, seg):>9.1f}")
+    print("=" * 70)
 
-    best = max(CONFIGS, key=lambda c: acc(results[c[0]]["loso"], False))
-    bname, bgroups, baug = best
-    print(f"\nBest by LOSO: '{bname}'. Detailed results follow.")
-    y, p, g, seg = results[bname]["loso"]
-    report(f"LOSO, '{bname}'", y, p, g, labels)
-    report(f"LOSO + smoothing (last {SMOOTH}), '{bname}'", y, smooth(p, seg), g, labels)
+    bname, bgroups, baug = max(CONFIGS, key=lambda c: accuracy_score(results[c[0]][0], results[c[0]][1]))
+    print(f"\nBest by raw LOSO: '{bname}'. Detailed results follow.")
+    y, p, g, seg, frac, ps = results[bname]
+    report(f"LOSO, '{bname}'", y, p, g, classes)
+    report(f"LOSO + soft vote (firmware settings), '{bname}'", y, ps, g, classes)
 
     # -------------------------------------------------------- diagnostics
     raw = np.concatenate([[d["raw"]] * len(d["F"]) for d in data])
     diagnose_merged(raw, p, g)
-    weak_sessions(y, p, g, labels)
+    weak_sessions(y, p, g, classes)
     worst_files(data, y, p, seg)
-    smoothing_sweep(y, p, seg)
-    merged_what_if(y, p, seg)
+    soft_vote_sweep(y, p, frac, seg, classes)
+    merged_what_if(y, p, ps)
 
     # --------------------------------------------------- feature importance
     cols = group_columns(bgroups)
@@ -514,9 +559,8 @@ def main():
     for j in np.argsort(imp)[::-1][:15]:
         print(f"  {FEATURE_NAMES[cols[j]]:<22}{imp[j]:.4f}")
 
-    print("\nOnly port a feature group to the firmware if it helps LOSO by a "
-          "clear margin (several points). Smoothing and calibration cost nothing "
-          "to train, so check their gain first.")
+    print("\nOnly port a feature group to the firmware if it helps LOSO by a clear "
+          "margin (several points).")
 
 
 if __name__ == "__main__":

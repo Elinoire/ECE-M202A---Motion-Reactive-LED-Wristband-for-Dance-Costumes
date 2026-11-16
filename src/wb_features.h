@@ -12,7 +12,7 @@
 
 namespace wb {
 
-constexpr int WIN = 100;          // samples per window (must equal MODEL_WIN in model.h)
+constexpr int WIN = 80;          // samples per window (must equal MODEL_WIN in model.h)
 constexpr int NCH = 8;            // ax ay az gx gy gz |accel| |gyro|
 constexpr int FEAT_DOM_BINS = 12; // must equal DOM_BINS in model.h
 constexpr int NFEAT = 90;         // must equal NUM_FEATURES in model.h
