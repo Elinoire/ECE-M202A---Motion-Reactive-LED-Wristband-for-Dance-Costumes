@@ -86,4 +86,3 @@ Connect Nano 33 BLE Sense Rev2 to laptop and selected board from dropdown list o
 Go to Tools > Manage Libraries > Type in Adafruit Dotstar and install the library along with dependent libraries.
 
 Go to Files > Examples > Adafruit Dotstar > onboard. Compile and run the code by clicking the (->) icon in the task bar at top.
-

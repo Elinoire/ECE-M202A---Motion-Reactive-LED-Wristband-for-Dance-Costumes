@@ -1,48 +1,35 @@
-"""Shared constants and feature code for export_model.py and verify_export.py.
+"""Compatibility shim. The feature code now lives in src/train/train.py (single source of truth),
+so scripts that still import wbcommon (live.py, verify_export.py, ...) see the same features,
+window size and exclusions as training and export_model.py.
 
-features() must match compute_features() in src/wb_features.h, and the
-constants must match train.py and live.py.
+features(w) now returns the FULL 90-feature vector; select columns with train.group_columns()
+if a script needs only the recipe's subset.
 """
 import glob
+import os
 import sys
 
 import numpy as np
 import pandas as pd
 
-SAMPLE_HZ = 89
-WIN = 50
-STRIDE = 25
-TRIM = 100
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "train"))
+import train as _t  # noqa: E402
 
-
-def features(w):
-    """w: (WIN, 6) array of ax ay az gx gy gz -> 56 features."""
-    acc_mag = np.linalg.norm(w[:, :3], axis=1)
-    gyro_mag = np.linalg.norm(w[:, 3:], axis=1)
-    x = np.column_stack([w, acc_mag, gyro_mag])
-    spec = np.abs(np.fft.rfft(x - x.mean(0), axis=0))
-    dom_freq = (spec[1:].argmax(0) + 1) * SAMPLE_HZ / len(x)
-    return np.concatenate([
-        x.mean(0),
-        x.std(0),
-        x.min(0),
-        x.max(0),
-        np.abs(np.diff(x, axis=0)).mean(0),
-        (x ** 2).mean(0),
-        dom_freq,
-    ])
+SAMPLE_HZ, WIN, STRIDE, TRIM = _t.SAMPLE_HZ, _t.WIN, _t.STRIDE, _t.TRIM
+features = _t.window_features
 
 
 def load_windows(pattern="data/*.csv"):
-    """Return raw windows (N, WIN, 6), labels (N,), sessions (N,)."""
-    files = sorted(glob.glob(pattern))
+    """Return raw windows (N, WIN, 6), MERGED labels (N,), sessions (N,); honours EXCLUDE."""
+    files = [p for p in sorted(glob.glob(pattern)) if os.path.basename(p) not in _t.EXCLUDE]
     if not files:
         sys.exit("No CSVs found in data/. Run this from the repo root after recording data.")
     raw, labels, sessions = [], [], []
     for path in files:
         df = pd.read_csv(path)
         arr = df[["ax", "ay", "az", "gx", "gy", "gz"]].to_numpy()[TRIM:-TRIM]
-        label, session = df["label"].iloc[0], df["session"].iloc[0]
+        label = _t.MERGE.get(df["label"].iloc[0], df["label"].iloc[0])
+        session = df["session"].iloc[0]
         for s in range(0, len(arr) - WIN + 1, STRIDE):
             raw.append(arr[s:s + WIN])
             labels.append(label)
