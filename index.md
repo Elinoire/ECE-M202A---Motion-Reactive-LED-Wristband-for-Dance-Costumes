@@ -9,7 +9,30 @@ title: Motion-Reactive LED Wristband for Dance Costumes
 
 An Arduino Nano 33 BLE Sense Rev2 worn on the wrist streams IMU data, and a classifier tells four movements apart: `still`, `leftright`, `updown`, `rotate`, and lights an APA102 LED strip in a different color for each movement.
 
-**Status:** data collection and offline classification work (99.1% accuracy on unseen sessions), and on-board classification with LED output work. BLE, the web app, and more sophisticated inference are not built yet.
+**Status:** data collection and offline classification work (99.1% accuracy on unseen sessions), and on-board classification with LED output work.
+
+## Final Scope
+1. LED strip turns on
+2. Collection of training data for specific dance moves (vs. general directions)
+3. Classifier correctly identifies movement corresponding to IMU data
+
+## Minimum Deliverable
+A system that can be used during dance and other art performances, that synchronizes the colors of a LED light strip to specific movements.
+
+## Evaluation Plan
+1. Baseline: Simple threshold/rule-based classifier on IMU values
+2. Primary metric: Classification accuracy on labeled trials per class, plus LED response latency (ms).
+3. Stress condition: Faster or noisier movement.
+4. Missing: Labeled motion data for specific dance moves (need to collect ourselves)
+
+## Remaining Risks
+1. Design is not wearable
+2. High Latency
+
+### Link to Slides
+https://docs.google.com/presentation/d/1O7Qg9AKKq4t3O7V1BodWmiS7-Hkh3Znb/edit?slide=id.p1#slide=id.p1
+
+----
 
 ## Setup (once)
 
