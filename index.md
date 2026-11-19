@@ -29,7 +29,17 @@ A system that can be used during dance and other art performances, that synchron
 1. Design is not wearable
 2. High Latency
 
-### Link to Slides
+## Response to Feedback
+1. When doing continuous dance moves, how is the model classification accuracy, especially considering the 0.56s delay? 
+
+We are working to improve our latency and have decided to work on specific dance moves for lighting changes, so the changes will not happen for every step in the dance.
+
+2. Consider implementing an overlapping sliding window with a 5-to-10 sample stride and check latency versus accuracy:
+
+We already use  a sliding window with a 10 sample stride, but this could be further reduced to a 5 window stride. For the question of latency we will try training on transitions, lower delay to confirm, use smaller windows, etc. We are actively working on tuning our accuracy vs. latency. One change that has already been made is to preemptively drop the use of Bluetooth for the project as the data transmission for IMU data was 0.5s, and we expect similar timings for other data transmission.
+
+
+### Link to Updated Slides
 https://docs.google.com/presentation/d/1O7Qg9AKKq4t3O7V1BodWmiS7-Hkh3Znb/edit?slide=id.p1#slide=id.p1
 
 ----
